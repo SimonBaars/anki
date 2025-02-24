@@ -16,6 +16,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use crate::sync::request::MAXIMUM_SYNC_PAYLOAD_BYTES;
+use axum::middleware::{self, Next};
+use axum::extract::Request;
+use axum::http::header;
+use std::path::PathBuf;
 
 use crate::sync::collection::protocol::SyncMethod;
 use crate::sync::collection::protocol::SyncProtocol;
@@ -133,56 +137,81 @@ pub(crate) struct UserListResponse {
     pub users: Vec<String>,
 }
 
+async fn check_auth<S>(
+    server: &S,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), StatusCode>
+where
+    S: std::ops::Deref<Target = SimpleServer>,
+{
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if !server.is_valid_admin_key(auth_header) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(())
+}
+
 pub(crate) fn user_management_router<S>() -> Router<S>
 where
     S: std::ops::Deref<Target = SimpleServer> + Clone + Send + Sync + 'static,
 {
+    async fn add_user_with_auth<S>(
+        State(server): State<S>,
+        headers: axum::http::HeaderMap,
+        Json(req): Json<AddUserRequest>,
+    ) -> Result<impl IntoResponse, StatusCode>
+    where
+        S: std::ops::Deref<Target = SimpleServer>,
+    {
+        check_auth(&server, &headers).await?;
+        server.add_user(req.username, req.password)
+            .map(|_| StatusCode::CREATED)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    }
+
+    async fn remove_user_with_auth<S>(
+        State(server): State<S>,
+        headers: axum::http::HeaderMap,
+        Json(req): Json<AddUserRequest>,
+    ) -> Result<impl IntoResponse, StatusCode>
+    where
+        S: std::ops::Deref<Target = SimpleServer>,
+    {
+        check_auth(&server, &headers).await?;
+        server.remove_user(&req.username)
+            .map(|_| StatusCode::OK)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    }
+
+    async fn list_users_with_auth<S>(
+        State(server): State<S>,
+        headers: axum::http::HeaderMap,
+    ) -> Result<impl IntoResponse, StatusCode>
+    where
+        S: std::ops::Deref<Target = SimpleServer>,
+    {
+        check_auth(&server, &headers).await?;
+        Ok(Json(UserListResponse {
+            users: server.list_users()
+        }))
+    }
+
     Router::new()
-        .route("/addUser", post(add_user_handler::<S>))
-        .route("/removeUser", post(remove_user_handler::<S>))
-        .route("/listUsers", get(list_users_handler::<S>))
-}
-
-pub(crate) async fn add_user_handler<S>(
-    State(server): State<S>,
-    Json(req): Json<AddUserRequest>,
-) -> impl IntoResponse
-where
-    S: std::ops::Deref<Target = SimpleServer>,
-{
-    server.add_user(req.username, req.password)
-        .map(|_| StatusCode::CREATED)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
-}
-
-pub(crate) async fn remove_user_handler<S>(
-    State(server): State<S>,
-    Json(req): Json<AddUserRequest>,
-) -> impl IntoResponse
-where
-    S: std::ops::Deref<Target = SimpleServer>,
-{
-    server.remove_user(&req.username)
-        .map(|_| StatusCode::OK)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
-}
-
-pub(crate) async fn list_users_handler<S>(
-    State(server): State<S>,
-) -> impl IntoResponse
-where
-    S: std::ops::Deref<Target = SimpleServer>,
-{
-    Json(UserListResponse {
-        users: server.list_users()
-    })
+        .route("/add", post(add_user_with_auth::<S>))
+        .route("/remove", post(remove_user_with_auth::<S>))
+        .route("/list", get(list_users_with_auth::<S>))
 }
 
 pub(crate) fn make_app(server: Arc<SimpleServer>) -> Router {
     Router::new()
-        .merge(collection_sync_router::<Arc<SimpleServer>>())
-        .merge(media_sync_router::<Arc<SimpleServer>>())
-        .merge(user_management_router::<Arc<SimpleServer>>())
+        .nest("/sync", collection_sync_router::<Arc<SimpleServer>>())
+        .nest("/msync", media_sync_router::<Arc<SimpleServer>>())
+        .nest("/ankiUser", user_management_router::<Arc<SimpleServer>>())
         .route("/health-check", get(health_check_handler))
         .with_state(server)
         .layer(DefaultBodyLimit::max(*MAXIMUM_SYNC_PAYLOAD_BYTES))
