@@ -1,0 +1,19 @@
+# version: '3'
+
+services:
+  ankiserver:
+    container_name: ankiserver
+    build:
+      context: ./ankiserver
+      args:
+        - ANKI_VERSION=${ANKI_VERSION:-25.02}
+    restart: always
+    ports:
+      - "127.0.0.1:8082:8080"
+    volumes:
+      - ${ANKI_DATA_DIR:-./data/anki}:/anki_data
+    environment:
+      - SYNC_USER1=root:MpBvMVZxGWSZ
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+
