@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
+use axum::routing::post;
 use axum::Router;
 use axum_client_ip::ClientIpSource;
 use pbkdf2::password_hash::PasswordHash;
@@ -58,6 +59,7 @@ pub struct SimpleServer {
 pub struct SimpleServerInner {
     /// hkey->user
     users: HashMap<String, User>,
+    base_folder: PathBuf,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -142,7 +144,10 @@ impl SimpleServerInner {
         if users.is_empty() {
             whatever!("No users defined; SYNC_USER1 env var should be set.");
         }
-        Ok(Self { users })
+        Ok(Self {
+            users,
+            base_folder: base_folder.to_path_buf(),
+        })
     }
 }
 
@@ -245,8 +250,11 @@ impl SimpleServer {
         let addr = listener.local_addr().unwrap();
         let server = with_logging_layer(
             Router::new()
-                .nest("/sync", collection_sync_router())
-                .nest("/msync", media_sync_router())
+                .nest("/sync", collection_sync_router::<Arc<SimpleServer>>())
+                .nest("/msync", media_sync_router::<Arc<SimpleServer>>())
+                .route("/addUser", post(routes::add_user_handler::<Arc<SimpleServer>>))
+                .route("/removeUser", post(routes::remove_user_handler::<Arc<SimpleServer>>))
+                .route("/listUsers", get(routes::list_users_handler::<Arc<SimpleServer>>))
                 .route("/health", get(health_check_handler))
                 .with_state(server)
                 .layer(DefaultBodyLimit::max(*MAXIMUM_SYNC_PAYLOAD_BYTES))
@@ -273,6 +281,63 @@ impl SimpleServer {
         let (_addr, server_fut) = SimpleServer::make_server(config).await?;
         server_fut.await.whatever_context("await server")?;
         Ok(())
+    }
+
+    pub fn add_user(&self, username: String, password: String) -> HttpResult<()> {
+        let mut state = self.state.lock().unwrap();
+        let base_folder = state.base_folder.clone();
+        
+        // Create user folder
+        let folder = base_folder.join(&username);
+        create_dir_all(&folder).or_internal_err("creating user folder")?;
+        
+        // Create media manager
+        let media = ServerMediaManager::new(&folder).or_internal_err("creating media manager")?;
+        
+        // Hash the password with a fixed salt (same as in new_from_env)
+        let password_hash = Pbkdf2
+            .hash_password(
+                password.as_bytes(),
+                &SaltString::from_b64("tonuvYGpksNFQBlEmm3lxg").unwrap(),
+            )
+            .expect("couldn't hash password")
+            .to_string();
+        
+        // Generate hkey
+        let hkey = derive_hkey(&format!("{}:{}", username, password));
+        
+        // Create and add user
+        let user = User {
+            name: username,
+            password_hash,
+            col: None,
+            sync_state: None,
+            media,
+            folder,
+        };
+        
+        state.users.insert(hkey, user);
+        Ok(())
+    }
+
+    pub fn remove_user(&self, username: &str) -> HttpResult<()> {
+        let mut state = self.state.lock().unwrap();
+        
+        // Find and remove user by username
+        let hkey = state.users.iter()
+            .find(|(_, user)| user.name == username)
+            .map(|(hkey, _)| hkey.clone())
+            .or_forbidden("user not found")?;
+        
+        state.users.remove(&hkey);
+        Ok(())
+    }
+
+    pub fn list_users(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state.users.values()
+            .map(|user| user.name.clone())
+            .collect()
     }
 }
 
