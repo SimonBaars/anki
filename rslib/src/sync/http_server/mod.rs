@@ -287,10 +287,10 @@ impl SimpleServer {
 
     fn is_valid_admin_key(&self, host_key: &str) -> bool {
         let state = self.state.lock().unwrap();
-        // Check if the provided key matches the first user (admin)
-        state.users.iter().next()
-            .map(|(key, _)| key == host_key)
-            .unwrap_or(false)
+        // Check if the provided key belongs to the root user
+        state.users.iter()
+            .find(|(key, user)| *key == host_key && user.name == "root")
+            .is_some()
     }
 
     fn persist_users(&self) -> HttpResult<()> {
