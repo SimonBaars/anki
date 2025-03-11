@@ -2106,7 +2106,7 @@ dependencies = [
  "log",
  "ndarray 0.15.6",
  "ndarray-rand",
- "priority-queue",
+ "priority-queue 2.1.1",
  "rand",
  "rayon",
  "serde",

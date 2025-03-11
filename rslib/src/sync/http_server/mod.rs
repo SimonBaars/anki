@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
+use axum::routing::post;
 use axum::Router;
 use axum_client_ip::SecureClientIpSource;
 use pbkdf2::password_hash::PasswordHash;
@@ -44,6 +45,7 @@ use crate::sync::http_server::media_manager::ServerMediaManager;
 use crate::sync::http_server::routes::collection_sync_router;
 use crate::sync::http_server::routes::health_check_handler;
 use crate::sync::http_server::routes::media_sync_router;
+use crate::sync::http_server::routes::user_management_router;
 use crate::sync::http_server::user::User;
 use crate::sync::login::HostKeyRequest;
 use crate::sync::login::HostKeyResponse;
@@ -58,6 +60,7 @@ pub struct SimpleServer {
 pub struct SimpleServerInner {
     /// hkey->user
     users: HashMap<String, User>,
+    base_folder: PathBuf,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -142,7 +145,10 @@ impl SimpleServerInner {
         if users.is_empty() {
             whatever!("No users defined; SYNC_USER1 env var should be set.");
         }
-        Ok(Self { users })
+        Ok(Self {
+            users,
+            base_folder: base_folder.to_path_buf(),
+        })
     }
 }
 
@@ -227,9 +233,12 @@ impl SimpleServer {
     }
     pub fn new(base_folder: &Path) -> error::Result<Self, Whatever> {
         let inner = SimpleServerInner::new_from_env(base_folder)?;
-        Ok(SimpleServer {
+        let server = SimpleServer {
             state: Mutex::new(inner),
-        })
+        };
+        // Load any persisted users
+        server.load_persisted_users().whatever_context("loading persisted users")?;
+        Ok(server)
     }
 
     pub async fn make_server(
@@ -245,10 +254,11 @@ impl SimpleServer {
         let addr = listener.local_addr().unwrap();
         let server = with_logging_layer(
             Router::new()
-                .nest("/sync", collection_sync_router())
-                .nest("/msync", media_sync_router())
+                .nest("/sync", collection_sync_router::<Arc<SimpleServer>>())
+                .nest("/msync", media_sync_router::<Arc<SimpleServer>>())
+                .nest("/ankiUser", routes::user_management_router::<Arc<SimpleServer>>())
                 .route("/health", get(health_check_handler))
-                .with_state(server)
+                .with_state(server.clone())
                 .layer(DefaultBodyLimit::max(*MAXIMUM_SYNC_PAYLOAD_BYTES))
                 .layer(config.ip_header.into_extension()),
         );
@@ -273,6 +283,129 @@ impl SimpleServer {
         let (_addr, server_fut) = SimpleServer::make_server(config).await?;
         server_fut.await.whatever_context("await server")?;
         Ok(())
+    }
+
+    fn is_valid_admin_key(&self, host_key: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        // Check if the provided key belongs to the root user
+        state.users.iter()
+            .find(|(key, user)| *key == host_key && user.name == "root")
+            .is_some()
+    }
+
+    fn persist_users(&self) -> HttpResult<()> {
+        let state = self.state.lock().unwrap();
+        let users_file = state.base_folder.join("users.json");
+        let users_data: Vec<(&String, &String, &String)> = state.users.iter()
+            .map(|(hkey, user)| (hkey, &user.name, &user.password_hash))
+            .collect();
+        std::fs::write(&users_file, serde_json::to_string(&users_data).unwrap())
+            .or_internal_err("failed to persist users")?;
+        Ok(())
+    }
+
+    fn load_persisted_users(&self) -> HttpResult<()> {
+        let mut state = self.state.lock().unwrap();
+        let users_file = state.base_folder.join("users.json");
+        if users_file.exists() {
+            let data = std::fs::read_to_string(&users_file)
+                .or_internal_err("failed to read users file")?;
+            let users_data: Vec<(String, String, String)> = serde_json::from_str(&data)
+                .or_internal_err("failed to parse users file")?;
+            
+            // Merge with existing users, keeping existing ones
+            for (hkey, name, password_hash) in users_data {
+                if !state.users.contains_key(&hkey) {
+                    let folder = state.base_folder.join(&name);
+                    if let Ok(media) = ServerMediaManager::new(&folder) {
+                        state.users.insert(hkey.clone(), User {
+                            name,
+                            password_hash,
+                            col: None,
+                            sync_state: None,
+                            media,
+                            folder,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_user(&self, username: String, password: String) -> HttpResult<()> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let base_folder = state.base_folder.clone();
+            
+            // Create user folder
+            let folder = base_folder.join(&username);
+            create_dir_all(&folder).or_internal_err("creating user folder")?;
+            
+            // Create media manager
+            let media = ServerMediaManager::new(&folder).or_internal_err("creating media manager")?;
+            
+            // Hash the password with a fixed salt (same as in new_from_env)
+            let password_hash = Pbkdf2
+                .hash_password(
+                    password.as_bytes(),
+                    &SaltString::from_b64("tonuvYGpksNFQBlEmm3lxg").unwrap(),
+                )
+                .expect("couldn't hash password")
+                .to_string();
+            
+            // Generate hkey
+            let hkey = derive_hkey(&format!("{}:{}", username, password));
+            
+            // Create and add user
+            let user = User {
+                name: username,
+                password_hash,
+                col: None,
+                sync_state: None,
+                media,
+                folder,
+            };
+            
+            state.users.insert(hkey, user);
+            Ok(())
+        };
+
+        // If user was added successfully, persist the changes
+        if result.is_ok() {
+            self.persist_users()?;
+        }
+        
+        result
+    }
+
+    pub fn remove_user(&self, username: &str) -> HttpResult<()> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            
+            // Find and remove user by username
+            let hkey = state.users.iter()
+                .find(|(_, user)| user.name == username)
+                .map(|(hkey, _)| hkey.clone())
+                .or_forbidden("user not found")?;
+            
+            state.users.remove(&hkey);
+            Ok(())
+        };
+
+        // If user was removed successfully, persist the changes
+        if result.is_ok() {
+            self.persist_users()?;
+        }
+
+        result
+    }
+
+    pub fn list_users(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state.users.values()
+            .map(|user| user.name.clone())
+            .collect()
     }
 }
 
