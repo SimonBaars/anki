@@ -5,6 +5,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use anki_io::create_dir_all;
 use anki_io::write_file;
 use anki_io::FileIoError;
 use anki_io::FileIoSnafu;
@@ -79,6 +80,10 @@ impl ServerMediaManager {
 }
 
 fn add_or_replace_file(path: &Path, data: Vec<u8>) -> error::Result<(), FileIoError> {
+    // Ensure the parent directory exists before writing the file
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
     write_file(path, data)
 }
 
